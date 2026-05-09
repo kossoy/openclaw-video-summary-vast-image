@@ -1,6 +1,6 @@
 # OpenClaw video-summary Vast image
 
-Prebuilt CUDA runtime for the OpenClaw `video-summary` skill.
+Prebuilt slim CUDA runtime for the OpenClaw `video-summary` skill.
 
 It bakes in:
 
@@ -10,6 +10,9 @@ It bakes in:
 - `yt-dlp`
 - `faster-whisper`
 - cached `large-v3-turbo` faster-whisper model
+
+The image uses NVIDIA's CUDA runtime base directly instead of the much heavier
+PyTorch image, so first-pull cold starts on random Vast hosts should be smaller.
 
 Published image:
 
