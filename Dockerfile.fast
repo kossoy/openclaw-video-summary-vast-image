@@ -58,13 +58,15 @@ uv pip install --python /opt/video-summary-venv/bin/python \
     requests
 
 # Remove runtime-unused deps pulled in transitively:
-#  - hf_xet: HF_HUB_DISABLE_XET=1 forces classic transport
-#  - sympy: not imported by faster-whisper at inference
-#  - av:    we feed pre-decoded WAV; faster-whisper supports numpy input
+#  - hf_xet (~11MB): HF_HUB_DISABLE_XET=1 forces classic transport, and the
+#    only call sites are lazy imports inside huggingface_hub upload helpers.
+#  - sympy (~30MB): only used by onnxruntime's symbolic_shape_infer.py (a
+#    dev tool), never touched on the inference path.
+# NOTE: 'av' (PyAV) is a hard top-level import in faster_whisper/audio.py;
+# attempting to drop it breaks `from faster_whisper import WhisperModel`.
 SP=/opt/video-summary-venv/lib/python3.10/site-packages
 rm -rf "$SP/hf_xet" "$SP"/hf_xet-*.dist-info \
-       "$SP/sympy" "$SP"/sympy-*.dist-info \
-       "$SP/av"    "$SP"/av-*.dist-info "$SP/av.libs"
+       "$SP/sympy" "$SP"/sympy-*.dist-info
 
 # ---- pre-cache large-v3-turbo (CPU+int8 download; runtime uses GPU+fp16) ----
 /opt/video-summary-venv/bin/python -c "from faster_whisper import WhisperModel; WhisperModel('large-v3-turbo', device='cpu', compute_type='int8')"
