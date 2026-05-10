@@ -1,7 +1,9 @@
 # syntax=docker/dockerfile:1.6
 # OpenClaw video-summary Vast worker — optimized for fast cold-start on Vast.ai.
-# Reduces image size by removing cuDNN libs unused by ctranslate2/faster-whisper
-# inference and trimming Python deps that are never imported at runtime.
+#
+# Strategy: every "delete" lives in the SAME RUN as its "create" so the bytes
+# never persist in any layer. cuDNN libs that ctranslate2/whisper inference
+# does NOT touch are removed in the base apt layer.
 FROM nvidia/cuda:12.4.1-cudnn-runtime-ubuntu22.04
 
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
@@ -14,76 +16,76 @@ ENV DEBIAN_FRONTEND=noninteractive \
     PIP_NO_CACHE_DIR=1 \
     UV_NO_CACHE=1
 
-# Trim cuDNN: drop libs that ctranslate2/whisper inference does not need.
-# - libcudnn_adv (230 MB): advanced training kernels, not used at inference.
-# - libcudnn_engines_precompiled (544 MB): precompiled kernel cache; we keep
-#   libcudnn_engines_runtime_compiled which JITs on demand. (TESTED at build.)
-# Keep: libcudnn, libcudnn_graph, libcudnn_ops, libcudnn_cnn,
-#       libcudnn_heuristic, libcudnn_engines_runtime_compiled
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends \
-      ca-certificates \
-      curl \
-      ffmpeg \
-      openssh-client \
-      python3 \
-      python3-venv \
-      unzip \
-      git \
-    && rm -rf /var/lib/apt/lists/* /var/log/* /var/cache/apt/* \
-    && rm -f /usr/lib/x86_64-linux-gnu/libcudnn_adv.so.9.1.0
+# Single RUN keeps deletes in the same layer as their creates so the bytes do
+# not leak into an earlier layer. Heredoc holds the multi-step shell script.
+RUN <<'BASH'
+set -euo pipefail
 
-# uv + deno installed to /usr/local/bin so they survive PATH resets
-# and so onstart finds them without /opt/conda or venv on PATH.
-RUN curl -LsSf https://astral.sh/uv/install.sh | env UV_INSTALL_DIR=/usr/local/bin sh \
-    && curl -fsSL https://deno.land/install.sh | DENO_INSTALL=/usr/local sh -s -- -y \
-    && ln -sf /usr/local/bin/uv /root/.local/bin/uv 2>/dev/null || mkdir -p /root/.local/bin && ln -sf /usr/local/bin/uv /root/.local/bin/uv \
-    && mkdir -p /root/.deno/bin && ln -sf /usr/local/bin/deno /root/.deno/bin/deno \
-    && uv --version && deno --version
+# ---- apt deps ----
+apt-get update
+apt-get install -y --no-install-recommends \
+    ca-certificates \
+    curl \
+    ffmpeg \
+    openssh-client \
+    python3 \
+    python3-venv \
+    unzip \
+    git
+rm -rf /var/lib/apt/lists/* /var/log/* /var/cache/apt/*
 
-# Build Python venv with only what the worker imports at runtime.
-# Skip faster-whisper extras (hf_xet, sympy, av) — not needed because:
-#  - hf_xet: HF_HUB_DISABLE_XET=1 forces classic transport.
-#  - sympy: pulled by torch deps, faster-whisper itself never imports it.
-#  - av: faster-whisper supports raw numpy/wav input; we feed pre-decoded WAV.
-RUN uv venv --python python3 /opt/video-summary-venv \
-    && /opt/video-summary-venv/bin/python -m ensurepip --upgrade \
-    && uv pip install --python /opt/video-summary-venv/bin/python \
-      "faster-whisper>=1.1.1" \
-      yt-dlp \
-      requests \
-    && /opt/video-summary-venv/bin/pip uninstall -y av sympy hf_xet 2>/dev/null || true
+# ---- trim cuDNN libs unused by ctranslate2/whisper inference ----
+# libcudnn_adv (~230MB): training-only kernels (rnn/attn/dropout); inference
+# path doesn't load it. We keep ops, cnn, graph, heuristic, engines_*.
+rm -f /usr/lib/x86_64-linux-gnu/libcudnn_adv.so.9 \
+      /usr/lib/x86_64-linux-gnu/libcudnn_adv.so.9.1.0
 
-# Pre-cache the large-v3-turbo model (used by run_remote_job).
-# CPU+int8 init only downloads weights; runtime uses GPU+float16.
-RUN /opt/video-summary-venv/bin/python - <<'PY'
-from faster_whisper import WhisperModel
-WhisperModel("large-v3-turbo", device="cpu", compute_type="int8")
-PY
+# ---- uv + deno installed to /usr/local/bin so onstart's bare PATH finds them ----
+curl -LsSf https://astral.sh/uv/install.sh | env UV_INSTALL_DIR=/usr/local/bin INSTALLER_NO_MODIFY_PATH=1 sh
+curl -fsSL https://deno.land/install.sh | DENO_INSTALL=/usr/local sh -s -- -y
+mkdir -p /root/.local/bin /root/.deno/bin
+ln -sf /usr/local/bin/uv /root/.local/bin/uv
+ln -sf /usr/local/bin/deno /root/.deno/bin/deno
+uv --version
+deno --version
 
-# Clean caches and pyc bloat.
-RUN find /opt/video-summary-venv -name __pycache__ -type d -exec rm -rf {} + 2>/dev/null || true \
-    && find /opt/video-summary-venv -name "*.pyc" -delete 2>/dev/null || true \
-    && rm -rf /root/.cache/uv /root/.cache/pip /tmp/*
+# ---- Python venv with only what the worker imports at runtime ----
+uv venv --python python3 /opt/video-summary-venv
+/opt/video-summary-venv/bin/python -m ensurepip --upgrade
+uv pip install --python /opt/video-summary-venv/bin/python \
+    "faster-whisper>=1.1.1" \
+    yt-dlp \
+    requests
 
-# Smoke-test that the surviving cuDNN set still resolves and core imports work.
+# Remove runtime-unused deps pulled in transitively:
+#  - hf_xet: HF_HUB_DISABLE_XET=1 forces classic transport
+#  - sympy: not imported by faster-whisper at inference
+#  - av:    we feed pre-decoded WAV; faster-whisper supports numpy input
+SP=/opt/video-summary-venv/lib/python3.10/site-packages
+rm -rf "$SP/hf_xet" "$SP"/hf_xet-*.dist-info \
+       "$SP/sympy" "$SP"/sympy-*.dist-info \
+       "$SP/av"    "$SP"/av-*.dist-info "$SP/av.libs"
+
+# ---- pre-cache large-v3-turbo (CPU+int8 download; runtime uses GPU+fp16) ----
+/opt/video-summary-venv/bin/python -c "from faster_whisper import WhisperModel; WhisperModel('large-v3-turbo', device='cpu', compute_type='int8')"
+
+# ---- final byte-trim ----
+find /opt/video-summary-venv -name __pycache__ -type d -exec rm -rf {} + 2>/dev/null || true
+find /opt/video-summary-venv -name "*.pyc" -delete 2>/dev/null || true
+rm -rf /root/.cache/uv /root/.cache/pip /tmp/*
+BASH
+
+# Symlink yt-dlp into /usr/local/bin so the onstart's bare PATH finds it.
+RUN ln -sf /opt/video-summary-venv/bin/yt-dlp /usr/local/bin/yt-dlp
+
+# Smoke-test that the trimmed image still functions.
 RUN ffmpeg -version >/dev/null \
     && deno --version >/dev/null \
     && uv --version >/dev/null \
     && /opt/video-summary-venv/bin/yt-dlp --version >/dev/null \
-    && /opt/video-summary-venv/bin/python - <<'PY'
-from faster_whisper import WhisperModel
-print("faster-whisper import ok")
-# Verify model files reachable.
-import os
-hf = os.environ.get("HF_HOME", "/root/.cache/huggingface")
-assert os.path.isdir(hf + "/hub"), "model cache missing"
-print("model cache present at", hf)
-PY
-
-# Symlink yt-dlp into /usr/local/bin so onstart finds it without venv-on-PATH.
-RUN ln -sf /opt/video-summary-venv/bin/yt-dlp /usr/local/bin/yt-dlp
+    && /opt/video-summary-venv/bin/python -c "from faster_whisper import WhisperModel; print('faster-whisper import ok')" \
+    && test -d /root/.cache/huggingface/hub && echo "model cache present"
 
 LABEL org.opencontainers.image.title="OpenClaw video-summary Vast worker (fast)" \
-      org.opencontainers.image.description="Slim CUDA12.4 worker for OpenClaw video-summary. Pre-cached large-v3-turbo, trimmed cuDNN, optimized for fast Vast.ai cold-start." \
+      org.opencontainers.image.description="Slim CUDA12.4 worker for OpenClaw video-summary. Pre-cached large-v3-turbo, trimmed cuDNN+venv, optimized for fast Vast.ai cold-start." \
       org.opencontainers.image.source="https://github.com/kossoy/openclaw-video-summary-vast-image"
