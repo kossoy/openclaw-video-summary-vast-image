@@ -14,7 +14,8 @@ ENV DEBIAN_FRONTEND=noninteractive \
     HF_HUB_DISABLE_XET=1 \
     HF_HUB_DOWNLOAD_TIMEOUT=120 \
     PIP_NO_CACHE_DIR=1 \
-    UV_NO_CACHE=1
+    UV_NO_CACHE=1 \
+    DENO_DIR=/opt/deno-cache
 
 # Single RUN keeps deletes in the same layer as their creates so the bytes do
 # not leak into an earlier layer. Heredoc holds the multi-step shell script.
@@ -49,13 +50,24 @@ ln -sf /usr/local/bin/deno /root/.deno/bin/deno
 uv --version
 deno --version
 
+# ---- bgutil PO token provider server ----
+# Removes the YouTube account-cookie dependency for the "Sign in to confirm
+# you're not a bot" check. Cloned + dep-installed + module-graph cached at
+# build time; the worker's run.sh just starts it and health-checks /ping.
+git clone --depth 1 --single-branch --branch 1.3.1 \
+    https://github.com/Brainicism/bgutil-ytdlp-pot-provider.git /opt/bgutil-pot-provider
+( cd /opt/bgutil-pot-provider/server \
+  && deno install --allow-scripts=npm:canvas --frozen \
+  && deno cache src/main.ts )
+
 # ---- Python venv with only what the worker imports at runtime ----
 uv venv --python python3 /opt/video-summary-venv
 /opt/video-summary-venv/bin/python -m ensurepip --upgrade
 uv pip install --python /opt/video-summary-venv/bin/python \
     "faster-whisper>=1.1.1" \
     yt-dlp \
-    requests
+    requests \
+    bgutil-ytdlp-pot-provider
 
 # Remove runtime-unused deps pulled in transitively:
 #  - hf_xet (~11MB): HF_HUB_DISABLE_XET=1 forces classic transport, and the
@@ -86,6 +98,8 @@ RUN ffmpeg -version >/dev/null \
     && uv --version >/dev/null \
     && /opt/video-summary-venv/bin/yt-dlp --version >/dev/null \
     && /opt/video-summary-venv/bin/python -c "from faster_whisper import WhisperModel; print('faster-whisper import ok')" \
+    && test -d /opt/bgutil-pot-provider/server/node_modules \
+    && /opt/video-summary-venv/bin/python -c "import yt_dlp_plugins.extractor.getpot_bgutil_http; print('bgutil pot plugin ok')" \
     && test -d /root/.cache/huggingface/hub && echo "model cache present"
 
 LABEL org.opencontainers.image.title="OpenClaw video-summary Vast worker (fast)" \
